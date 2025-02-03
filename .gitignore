@@ -1,0 +1,6 @@
+venv/
+config.py
+.venv
+downloads/
+instructions/
+__pycache__/
