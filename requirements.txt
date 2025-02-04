@@ -1,3 +1,19 @@
-requests>=2.31.0
-m3u8>=3.6.0
-tqdm>=4.66.1 
+# Core dependencies
+requests>=2.25.1
+m3u8>=0.9.0
+tqdm>=4.61.0
+ffmpeg-python>=0.2.0
+
+# Build dependencies
+setuptools>=59.5.0
+wheel>=0.37.0
+
+# Whisper dependencies
+openai-whisper>=20231117
+torch>=2.1.0
+numpy>=1.21.0
+
+# Audio processing
+soundfile>=0.12.0
+librosa>=0.10.0
+scipy>=1.7.0 

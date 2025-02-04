@@ -3,7 +3,7 @@ import m3u8
 import requests
 from tqdm import tqdm
 from typing import List, Dict, Optional, Tuple
-from config import TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, DOWNLOAD_THREADS
+from config import TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, DOWNLOAD_THREADS, WHISPER_MODEL
 from urllib.parse import urljoin
 import concurrent.futures
 
@@ -14,6 +14,7 @@ class TwitchScraper:
         self.access_token = None
         self.headers = None
         self.max_workers = DOWNLOAD_THREADS
+        self.whisper_model = WHISPER_MODEL
         
     def authenticate(self) -> None:
         """Authenticate with Twitch API and get access token"""
@@ -417,6 +418,103 @@ class TwitchScraper:
                 os.remove(output_path)  # Clean up partial file
             raise
 
+    def process_audio(self, audio_path: str, transcript_path: str) -> None:
+        """Process audio with transcription"""
+        try:
+            import whisper
+        except ImportError as e:
+            raise ImportError(f"Please install required packages: {e}")
+            
+        # Load Whisper model
+        print(f"\nLoading Whisper model: {self.whisper_model}")
+        model = whisper.load_model(self.whisper_model)
+        
+        # Transcribe audio
+        print("\nTranscribing audio...")
+        result = model.transcribe(audio_path)
+        
+        # Clean text (remove non-ASCII but keep punctuation)
+        text = ''.join(char for char in result["text"] if ord(char) < 128)
+        
+        # Write the output
+        print(f"\nSaving transcription to: {transcript_path}")
+        with open(transcript_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def download_and_transcribe(self, vod_id: str, transcript_path: str, max_workers: int = None) -> None:
+        """Download VOD, convert to audio, and process with transcription"""
+        try:
+            import ffmpeg
+        except ImportError as e:
+            raise ImportError(f"Please install required packages: {e}")
+
+        max_workers = max_workers or self.max_workers
+        
+        # Set up output paths
+        audio_path = transcript_path.replace('_transcript.txt', '.wav')
+        os.makedirs(os.path.dirname(transcript_path), exist_ok=True)
+        
+        # Get playlist
+        playlist_url = self.get_vod_playlist(vod_id)
+        if not playlist_url:
+            raise ValueError(f"Could not get playlist for VOD {vod_id}")
+            
+        playlist = m3u8.load(playlist_url)
+        base_url = playlist_url.rsplit('/', 1)[0] + '/'
+        
+        total_segments = len(playlist.segments)
+        print(f"\nDownloading {total_segments} segments using {max_workers} workers...")
+        
+        try:
+            # Create ffmpeg process
+            process = (
+                ffmpeg
+                .input('pipe:0', f='mpegts')
+                .output(
+                    audio_path,
+                    acodec='pcm_s16le',
+                    ac=2,
+                    ar='48k'
+                )
+                .overwrite_output()
+                .run_async(pipe_stdin=True, pipe_stdout=True, pipe_stderr=True)
+            )
+            
+            # Download and process segments
+            downloaded_segments = {}
+            with tqdm(total=total_segments, desc="Downloading segments") as pbar:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_segment = {
+                        executor.submit(self.download_segment, (base_url, segment.uri, i)): i
+                        for i, segment in enumerate(playlist.segments)
+                    }
+                    
+                    for future in concurrent.futures.as_completed(future_to_segment):
+                        index, data = future.result()
+                        downloaded_segments[index] = data
+                        pbar.update(1)
+                        
+                        # Write segments in order
+                        while len(downloaded_segments) > 0:
+                            next_index = min(downloaded_segments.keys())
+                            process.stdin.write(downloaded_segments.pop(next_index))
+            
+            # Finish audio conversion
+            process.stdin.close()
+            process.wait()
+            print(f"\nAudio saved to: {audio_path}")
+            
+            # Process audio with transcription
+            self.process_audio(audio_path, transcript_path)
+            
+        except Exception as e:
+            print(f"\nError processing VOD: {e}")
+            # Clean up files on error
+            for path in [audio_path, transcript_path]:
+                if os.path.exists(path):
+                    os.remove(path)
+            raise
+
 def main():
     scraper = TwitchScraper()
     
@@ -444,10 +542,9 @@ def main():
                 choice = input("Enter your choice (1-3): ")
                 
                 if choice in ('1', '3'):
-                    output_path = f"downloads/{vod['id']}.mp4"
-                    print(f"\nDownloading VOD: {vod['title']}")
-                    scraper.download_vod(vod['id'], output_path)
-                    print(f"VOD downloaded successfully to: {output_path}")
+                    transcript_path = f"downloads/{vod['id']}_transcript.txt"
+                    print(f"\nDownloading and transcribing VOD: {vod['title']}")
+                    scraper.download_and_transcribe(vod['id'], transcript_path)
                 
                 if choice in ('2', '3'):
                     chat_path = f"downloads/{vod['id']}_chat.txt"
