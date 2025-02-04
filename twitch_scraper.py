@@ -3,7 +3,7 @@ import m3u8
 import requests
 from tqdm import tqdm
 from typing import List, Dict, Optional, Tuple
-from config import TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, DOWNLOAD_THREADS, WHISPER_MODEL, HUGGINGFACE_API_KEY
+from config import TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, DOWNLOAD_THREADS, WHISPER_MODEL, HUGGINGFACE_API_KEY, USE_GPU
 from urllib.parse import urljoin
 import concurrent.futures
 
@@ -16,28 +16,43 @@ class TwitchScraper:
         self.max_workers = DOWNLOAD_THREADS
         self.whisper_model = WHISPER_MODEL
         
-        # Initialize pyannote pipeline
+        # Initialize models
         try:
+            # Initialize pyannote pipeline
             import torch
             from pyannote.audio import Pipeline
+            from faster_whisper import WhisperModel
             
-            # Check if CUDA is available
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"\nUsing device: {device} for diarization")
+            # Set device based on config and availability
+            device = "cuda" if USE_GPU and torch.cuda.is_available() else "cpu"
+            print(f"\nUsing device: {device} for models")
             
-            # Initialize pipeline with device specification
+            # Initialize diarization pipeline
             self.diarization_pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.0",
                 use_auth_token=HUGGINGFACE_API_KEY
             )
             self.diarization_pipeline.to(torch.device(device))
             
+            # Initialize faster-whisper
+            print(f"\nInitializing Whisper model: {self.whisper_model}")
+            
+            # Set compute type based on device
+            if device == "cuda":
+                compute_type = "float16"
+            else:
+                compute_type = "int8"
+            
+            self.whisper_model = WhisperModel(
+                self.whisper_model,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=4 if device == "cpu" else None
+            )
+            print(f"Using {compute_type} compute type on {device}")
+            
         except Exception as e:
-            print(f"\nError initializing diarization pipeline: {e}")
-            print("Please ensure you have:")
-            print("1. Accepted the user agreement at https://huggingface.co/pyannote/speaker-diarization-3.0")
-            print("2. Used a valid Hugging Face API token")
-            print("3. Installed all required dependencies")
+            print(f"\nError initializing models: {e}")
             raise
         
     def authenticate(self) -> None:
@@ -445,9 +460,9 @@ class TwitchScraper:
     def process_audio(self, audio_path: str, transcript_path: str) -> None:
         """Process audio with speaker diarization and transcription"""
         try:
-            import whisper
-            import torch
+            import numpy as np
             import librosa
+            import soundfile as sf
         except ImportError as e:
             raise ImportError(f"Please install required packages: {e}")
             
@@ -457,47 +472,56 @@ class TwitchScraper:
             diarization = self.diarization_pipeline(audio_path)
         except Exception as e:
             print(f"\nError during diarization: {e}")
-            print("This could be due to:")
-            print("1. Invalid audio format")
-            print("2. Insufficient memory")
-            print("3. CUDA issues")
             raise
             
-        # Load Whisper model
-        print(f"\nLoading Whisper model: {self.whisper_model}")
-        model = whisper.load_model(self.whisper_model)
-        
         # Load the full audio file
         print("\nLoading audio file...")
-        audio, sr = librosa.load(audio_path, sr=16000)  # Whisper expects 16kHz
+        audio, sr = librosa.load(audio_path, sr=16000)  # 16kHz for Whisper
         
         # Process each speaker segment
         print("\nTranscribing segments...")
         segments = []
         
         for turn, _, speaker in diarization.itertracks(yield_label=True):
-            # Get audio segment timestamps and convert to samples
+            # Get segment timestamps and convert to samples
             start_sample = int(turn.start * sr)
             end_sample = int(turn.end * sr)
+            
+            # Skip very short segments
+            if end_sample - start_sample < 1600:  # Skip segments shorter than 100ms
+                continue
             
             # Extract the audio segment
             segment_audio = audio[start_sample:end_sample]
             
-            # Convert audio segment to float32 tensor
-            segment_tensor = torch.from_numpy(segment_audio).float()
-            
-            # Transcribe this segment
-            result = model.transcribe(segment_tensor)
-            
-            # Clean text (remove non-ASCII but keep punctuation)
-            text = ''.join(char for char in result["text"] if ord(char) < 128)
-            
-            segments.append({
-                'start': turn.start,
-                'end': turn.end,
-                'speaker': speaker,
-                'text': text.strip()
-            })
+            # Save segment to temporary file
+            temp_path = f"temp_segment_{start_sample}_{end_sample}.wav"
+            try:
+                sf.write(temp_path, segment_audio, sr)
+                
+                # Transcribe this segment
+                result, _ = self.whisper_model.transcribe(temp_path)
+                
+                # Get the transcribed text
+                text = " ".join([segment.text for segment in result])
+                
+                # Clean text (remove non-ASCII but keep punctuation)
+                text = ''.join(char for char in text if ord(char) < 128)
+                
+                if text.strip():  # Only add non-empty segments
+                    segments.append({
+                        'start': turn.start,
+                        'end': turn.end,
+                        'speaker': speaker,
+                        'text': text.strip()
+                    })
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        
+        # Sort segments by start time to ensure chronological order
+        segments.sort(key=lambda x: x['start'])
         
         # Write the combined output
         print(f"\nSaving transcription to: {transcript_path}")
