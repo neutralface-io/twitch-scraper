@@ -3,7 +3,7 @@ import m3u8
 import requests
 from tqdm import tqdm
 from typing import List, Dict, Optional, Tuple
-from config import TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, DOWNLOAD_THREADS, WHISPER_MODEL
+from config import TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, DOWNLOAD_THREADS, WHISPER_MODEL, HUGGINGFACE_API_KEY
 from urllib.parse import urljoin
 import concurrent.futures
 
@@ -15,6 +15,30 @@ class TwitchScraper:
         self.headers = None
         self.max_workers = DOWNLOAD_THREADS
         self.whisper_model = WHISPER_MODEL
+        
+        # Initialize pyannote pipeline
+        try:
+            import torch
+            from pyannote.audio import Pipeline
+            
+            # Check if CUDA is available
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"\nUsing device: {device} for diarization")
+            
+            # Initialize pipeline with device specification
+            self.diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.0",
+                use_auth_token=HUGGINGFACE_API_KEY
+            )
+            self.diarization_pipeline.to(torch.device(device))
+            
+        except Exception as e:
+            print(f"\nError initializing diarization pipeline: {e}")
+            print("Please ensure you have:")
+            print("1. Accepted the user agreement at https://huggingface.co/pyannote/speaker-diarization-3.0")
+            print("2. Used a valid Hugging Face API token")
+            print("3. Installed all required dependencies")
+            raise
         
     def authenticate(self) -> None:
         """Authenticate with Twitch API and get access token"""
@@ -419,27 +443,68 @@ class TwitchScraper:
             raise
 
     def process_audio(self, audio_path: str, transcript_path: str) -> None:
-        """Process audio with transcription"""
+        """Process audio with speaker diarization and transcription"""
         try:
             import whisper
+            import torch
+            import librosa
         except ImportError as e:
             raise ImportError(f"Please install required packages: {e}")
+            
+        print("\nPerforming speaker diarization...")
+        try:
+            # Perform diarization
+            diarization = self.diarization_pipeline(audio_path)
+        except Exception as e:
+            print(f"\nError during diarization: {e}")
+            print("This could be due to:")
+            print("1. Invalid audio format")
+            print("2. Insufficient memory")
+            print("3. CUDA issues")
+            raise
             
         # Load Whisper model
         print(f"\nLoading Whisper model: {self.whisper_model}")
         model = whisper.load_model(self.whisper_model)
         
-        # Transcribe audio
-        print("\nTranscribing audio...")
-        result = model.transcribe(audio_path)
+        # Load the full audio file
+        print("\nLoading audio file...")
+        audio, sr = librosa.load(audio_path, sr=16000)  # Whisper expects 16kHz
         
-        # Clean text (remove non-ASCII but keep punctuation)
-        text = ''.join(char for char in result["text"] if ord(char) < 128)
+        # Process each speaker segment
+        print("\nTranscribing segments...")
+        segments = []
         
-        # Write the output
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            # Get audio segment timestamps and convert to samples
+            start_sample = int(turn.start * sr)
+            end_sample = int(turn.end * sr)
+            
+            # Extract the audio segment
+            segment_audio = audio[start_sample:end_sample]
+            
+            # Convert audio segment to float32 tensor
+            segment_tensor = torch.from_numpy(segment_audio).float()
+            
+            # Transcribe this segment
+            result = model.transcribe(segment_tensor)
+            
+            # Clean text (remove non-ASCII but keep punctuation)
+            text = ''.join(char for char in result["text"] if ord(char) < 128)
+            
+            segments.append({
+                'start': turn.start,
+                'end': turn.end,
+                'speaker': speaker,
+                'text': text.strip()
+            })
+        
+        # Write the combined output
         print(f"\nSaving transcription to: {transcript_path}")
         with open(transcript_path, 'w', encoding='utf-8') as f:
-            f.write(text)
+            for segment in segments:
+                timestamp = f"[{int(segment['start'])//60:02d}:{int(segment['start'])%60:02d}]"
+                f.write(f"{timestamp} {segment['speaker']}: {segment['text']}\n")
 
     def download_and_transcribe(self, vod_id: str, transcript_path: str, max_workers: int = None) -> None:
         """Download VOD, convert to audio, and process with transcription"""

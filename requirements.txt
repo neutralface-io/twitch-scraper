@@ -16,4 +16,13 @@ numpy>=1.21.0
 # Audio processing
 soundfile>=0.12.0
 librosa>=0.10.0
-scipy>=1.7.0 
+scipy>=1.7.0
+
+# Diarization
+pyannote.audio>=3.1.1
+onnxruntime>=1.15.0
+onnxruntime-gpu>=1.15.0  # For GPU support
+einops>=0.6.1  # Required by pyannote
+pytorch-metric-learning>=2.1.0  # Required by pyannote
+torchmetrics>=1.0.0  # Required by pyannote
+lightning>=2.0.0  # Required by pyannote 
